@@ -1,245 +1,176 @@
-"""Feature extraction and embedding generation."""
+"""Advanced embedding extraction and manipulation for genomic sequences."""
 
 import numpy as np
-from typing import Optional, List, Dict, Any
+import torch
+import torch.nn as nn
+from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
-
-try:
-    import torch
-    import torch.nn as nn
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
-from alphagenome.data import genome
-from alphagenome.models import dna_client
 
 
 @dataclass
-class SequenceEmbedding:
-    """Container for sequence embeddings."""
-    embeddings: np.ndarray
-    interval: genome.Interval
-    layer: str
-    metadata: Dict[str, Any]
+class EmbeddingConfig:
+    """Configuration for embedding extraction."""
+    embedding_dim: int = 512
+    pooling_strategy: str = 'mean'  # 'mean', 'max', 'cls', 'attention'
+    normalize: bool = True
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 
-class FeatureExtractor:
-    """Extract features and embeddings from AlphaGenome predictions.
+class AlphaGenomeEmbeddingExtractor:
+    """Extract and process embeddings from AlphaGenome predictions."""
     
-    Enables downstream ML tasks by extracting intermediate representations
-    from AlphaGenome's predictions.
-    
-    Example:
-        >>> extractor = FeatureExtractor(api_key='YOUR_KEY')
-        >>> embeddings = extractor.get_sequence_embeddings(
-        ...     interval=genome.Interval('chr22', 36200000, 36210000),
-        ...     layer='intermediate'
-        ... )
-        >>> print(embeddings.shape)  # (sequence_length, embedding_dim)
-    """
-    
-    def __init__(self, api_key: str):
-        """Initialize feature extractor.
+    def __init__(self, config: EmbeddingConfig):
+        self.config = config
+        self.device = torch.device(config.device)
+        
+    def extract_from_predictions(self, 
+                                predictions: Dict[str, np.ndarray],
+                                sequence_length: int) -> torch.Tensor:
+        """Extract embeddings from AlphaGenome prediction outputs.
         
         Args:
-            api_key: AlphaGenome API key
-        """
-        self.model = dna_client.create(api_key)
-    
-    def get_sequence_embeddings(
-        self,
-        interval: genome.Interval,
-        ontology_terms: Optional[List[str]] = None,
-        layer: str = 'intermediate',
-    ) -> SequenceEmbedding:
-        """Extract sequence embeddings for genomic interval.
-        
-        Args:
-            interval: Genomic interval
-            ontology_terms: Optional tissue/cell type context
-            layer: Which layer to extract ('intermediate', 'final', 'attention')
+            predictions: Dictionary of prediction arrays from AlphaGenome
+            sequence_length: Length of the input sequence
             
         Returns:
-            SequenceEmbedding object
+            Embedding tensor of shape (batch, embedding_dim)
         """
-        # Make prediction to get outputs
-        outputs = self.model.predict(
-            interval=interval,
-            ontology_terms=ontology_terms or ['UBERON:0000948'],  # Heart default
-            requested_outputs=[dna_client.OutputType.RNA_SEQ],
-        )
+        # Stack different prediction modalities
+        features = []
         
-        # Extract embeddings from outputs
-        # Note: This is a simplified example - actual implementation would
-        # need to access model internals or use dedicated embedding endpoints
-        rna_seq = outputs.rna_seq
+        for key, value in predictions.items():
+            if isinstance(value, np.ndarray):
+                # Flatten spatial dimensions if needed
+                if len(value.shape) > 2:
+                    value = value.reshape(value.shape[0], -1)
+                features.append(torch.from_numpy(value))
         
-        # Convert to numpy array and generate pseudo-embeddings
-        # In real implementation, this would extract actual model embeddings
-        embeddings = self._generate_embeddings_from_predictions(rna_seq, layer)
+        # Concatenate all features
+        combined = torch.cat(features, dim=-1).to(self.device)
         
-        return SequenceEmbedding(
-            embeddings=embeddings,
-            interval=interval,
-            layer=layer,
-            metadata={'ontology_terms': ontology_terms or []},
-        )
-    
-    def _generate_embeddings_from_predictions(
-        self,
-        predictions: Any,
-        layer: str,
-    ) -> np.ndarray:
-        """Generate embeddings from predictions.
+        # Apply pooling
+        embeddings = self._pool_features(combined)
         
-        Note: Placeholder implementation. Real version would access
-        model internals or use dedicated API endpoints.
-        
-        Args:
-            predictions: Model predictions
-            layer: Layer to extract from
+        if self.config.normalize:
+            embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
             
-        Returns:
-            Embedding array
-        """
-        # Convert predictions to array
-        if hasattr(predictions, 'values'):
-            values = np.array(predictions.values)
-        else:
-            values = np.array(predictions)
-        
-        # Generate pseudo-embeddings based on layer
-        embedding_dim = {'intermediate': 512, 'final': 256, 'attention': 128}[layer]
-        
-        # Reshape/project to embedding dimension
-        seq_len = len(values)
-        embeddings = np.random.randn(seq_len, embedding_dim)  # Placeholder
-        
         return embeddings
     
-    def extract_variant_features(
-        self,
-        variant: genome.Variant,
-        interval: genome.Interval,
-        ontology_terms: Optional[List[str]] = None,
-    ) -> Dict[str, np.ndarray]:
-        """Extract feature vectors for variant effect prediction.
-        
-        Args:
-            variant: Variant to analyze
-            interval: Genomic context
-            ontology_terms: Tissue/cell type context
-            
-        Returns:
-            Dictionary of feature vectors
-        """
-        # Get predictions for reference and alternate
-        outputs = self.model.predict_variant(
-            interval=interval,
-            variant=variant,
-            ontology_terms=ontology_terms or ['UBERON:0000948'],
-            requested_outputs=[
-                dna_client.OutputType.RNA_SEQ,
-                dna_client.OutputType.CAGE,
-            ],
+    def _pool_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Apply pooling strategy to features."""
+        if self.config.pooling_strategy == 'mean':
+            return features.mean(dim=1)
+        elif self.config.pooling_strategy == 'max':
+            return features.max(dim=1)[0]
+        elif self.config.pooling_strategy == 'cls':
+            return features[:, 0, :]
+        else:
+            return features.mean(dim=1)
+
+
+class ContrastiveLearningHead(nn.Module):
+    """Contrastive learning head for genomic embeddings."""
+    
+    def __init__(self, input_dim: int, projection_dim: int = 256):
+        super().__init__()
+        self.projection = nn.Sequential(
+            nn.Linear(input_dim, input_dim),
+            nn.ReLU(),
+            nn.Linear(input_dim, projection_dim)
         )
         
-        # Extract features
-        features = {
-            'rna_seq_ref': np.array(outputs.reference.rna_seq.values),
-            'rna_seq_alt': np.array(outputs.alternate.rna_seq.values),
-            'rna_seq_diff': np.array(outputs.alternate.rna_seq.values) - 
-                           np.array(outputs.reference.rna_seq.values),
-        }
-        
-        if hasattr(outputs.reference, 'cage'):
-            features['cage_ref'] = np.array(outputs.reference.cage.values)
-            features['cage_alt'] = np.array(outputs.alternate.cage.values)
-            features['cage_diff'] = features['cage_alt'] - features['cage_ref']
-        
-        return features
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.normalize(self.projection(x), dim=-1)
 
 
-if TORCH_AVAILABLE:
-    class EmbeddingModel(nn.Module):
-        """PyTorch model for embedding-based prediction tasks.
+class GenomicContrastiveLoss(nn.Module):
+    """NT-Xent loss for genomic sequence contrastive learning."""
+    
+    def __init__(self, temperature: float = 0.07):
+        super().__init__()
+        self.temperature = temperature
         
-        Example:
-            >>> model = EmbeddingModel(embedding_dim=512, hidden_dim=256, output_dim=1)
-            >>> embeddings = torch.randn(32, 100, 512)  # batch, seq, embed
-            >>> predictions = model(embeddings)
+    def forward(self, z_i: torch.Tensor, z_j: torch.Tensor) -> torch.Tensor:
+        """Compute contrastive loss between two views.
+        
+        Args:
+            z_i: First set of embeddings (batch_size, dim)
+            z_j: Second set of embeddings (batch_size, dim)
+            
+        Returns:
+            Scalar loss value
         """
+        batch_size = z_i.shape[0]
         
-        def __init__(
-            self,
-            embedding_dim: int,
-            hidden_dim: int = 256,
-            output_dim: int = 1,
-            num_layers: int = 2,
-            dropout: float = 0.1,
-        ):
-            """Initialize embedding model.
-            
-            Args:
-                embedding_dim: Input embedding dimension
-                hidden_dim: Hidden layer dimension
-                output_dim: Output dimension
-                num_layers: Number of transformer layers
-                dropout: Dropout rate
-            """
-            super().__init__()
-            
-            self.embedding_dim = embedding_dim
-            
-            # Transformer encoder
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=embedding_dim,
-                nhead=8,
-                dim_feedforward=hidden_dim * 4,
-                dropout=dropout,
-                batch_first=True,
-            )
-            self.transformer = nn.TransformerEncoder(
-                encoder_layer,
-                num_layers=num_layers,
-            )
-            
-            # Prediction head
-            self.prediction_head = nn.Sequential(
-                nn.Linear(embedding_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, hidden_dim // 2),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim // 2, output_dim),
-            )
+        # Concatenate embeddings
+        z = torch.cat([z_i, z_j], dim=0)
         
-        def forward(self, embeddings: torch.Tensor) -> torch.Tensor:
-            """Forward pass.
+        # Compute similarity matrix
+        sim_matrix = torch.mm(z, z.t()) / self.temperature
+        
+        # Create labels
+        labels = torch.arange(batch_size).to(z.device)
+        labels = torch.cat([labels + batch_size, labels])
+        
+        # Mask out self-similarities
+        mask = torch.eye(2 * batch_size, dtype=torch.bool).to(z.device)
+        sim_matrix.masked_fill_(mask, float('-inf'))
+        
+        # Compute loss
+        loss = nn.functional.cross_entropy(sim_matrix, labels)
+        
+        return loss
+
+
+class VariantEffectPredictor(nn.Module):
+    """Neural network for predicting variant effects from embeddings."""
+    
+    def __init__(self, 
+                 embedding_dim: int,
+                 hidden_dims: List[int] = [512, 256, 128],
+                 num_classes: int = 3,
+                 dropout: float = 0.3):
+        super().__init__()
+        
+        layers = []
+        prev_dim = embedding_dim
+        
+        for hidden_dim in hidden_dims:
+            layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            ])
+            prev_dim = hidden_dim
             
-            Args:
-                embeddings: Input embeddings (batch, seq_len, embedding_dim)
-                
-            Returns:
-                Predictions (batch, output_dim)
-            """
-            # Apply transformer
-            transformed = self.transformer(embeddings)
-            
-            # Global average pooling
-            pooled = transformed.mean(dim=1)
-            
-            # Prediction
-            output = self.prediction_head(pooled)
-            
-            return output
-else:
-    class EmbeddingModel:
-        """Placeholder when PyTorch is not available."""
-        def __init__(self, *args, **kwargs):
-            raise ImportError(
-                "PyTorch is required for EmbeddingModel. "
-                "Install with: pip install torch"
-            )
+        layers.append(nn.Linear(prev_dim, num_classes))
+        self.network = nn.Sequential(*layers)
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.network(x)
+
+
+def compute_embedding_similarity(emb1: torch.Tensor, 
+                                emb2: torch.Tensor,
+                                metric: str = 'cosine') -> torch.Tensor:
+    """Compute similarity between two sets of embeddings.
+    
+    Args:
+        emb1: First embedding tensor (batch1, dim)
+        emb2: Second embedding tensor (batch2, dim)
+        metric: Similarity metric ('cosine', 'euclidean', 'dot')
+        
+    Returns:
+        Similarity matrix (batch1, batch2)
+    """
+    if metric == 'cosine':
+        emb1_norm = torch.nn.functional.normalize(emb1, p=2, dim=-1)
+        emb2_norm = torch.nn.functional.normalize(emb2, p=2, dim=-1)
+        return torch.mm(emb1_norm, emb2_norm.t())
+    elif metric == 'euclidean':
+        return -torch.cdist(emb1, emb2, p=2)
+    elif metric == 'dot':
+        return torch.mm(emb1, emb2.t())
+    else:
+        raise ValueError(f"Unknown metric: {metric}")

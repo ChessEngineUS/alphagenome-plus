@@ -1,8 +1,9 @@
-"""QAOA-based variant prioritization and optimization."""
+"""QAOA-based optimization for variant prioritization and feature selection."""
 
 import numpy as np
-from typing import List, Dict, Any, Optional
+from typing import List, Tuple, Optional, Dict
 from dataclasses import dataclass
+import warnings
 
 try:
     from qiskit import QuantumCircuit
@@ -12,319 +13,232 @@ try:
     QISKIT_AVAILABLE = True
 except ImportError:
     QISKIT_AVAILABLE = False
+    warnings.warn("Qiskit not installed. Quantum optimization features disabled.")
 
-from alphagenome.data import genome
+try:
+    import scipy.optimize as opt
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 
 @dataclass
-class OptimizationResult:
-    """Result of QAOA optimization."""
-    selected_variants: List[genome.Variant]
-    objective_value: float
-    qaoa_params: Dict[str, np.ndarray]
-    iterations: int
+class QAOAConfig:
+    """Configuration for QAOA optimization."""
+    num_layers: int = 3
+    max_iterations: int = 100
+    initial_point: Optional[List[float]] = None
+    optimizer: str = 'COBYLA'
+    shots: int = 1024
 
 
-class QAOAVariantOptimizer:
-    """QAOA-based variant selection and prioritization.
+class VariantPrioritizationQAOA:
+    """QAOA-based variant prioritization using quantum optimization.
     
-    Uses Quantum Approximate Optimization Algorithm to solve combinatorial
-    optimization problems in variant selection, such as:
-    - Maximizing pathogenicity score coverage
-    - Satisfying distance constraints between variants
-    - Balancing multiple objectives (clinical relevance, novelty, etc.)
-    
-    Example:
-        >>> optimizer = QAOAVariantOptimizer(n_layers=3)
-        >>> result = optimizer.optimize_selection(
-        ...     variants=variant_list,
-        ...     scores=pathogenicity_scores,
-        ...     constraints={'max_variants': 10, 'min_distance': 1000}
-        ... )
-        >>> print(f"Selected {len(result.selected_variants)} variants")
+    This implements a quantum approximate optimization algorithm for selecting
+    the most important variants from a large set based on their predicted
+    pathogenicity scores and pairwise correlations.
     """
     
-    def __init__(
-        self,
-        n_layers: int = 3,
-        backend: str = 'qiskit_aer',
-        shots: int = 1024,
-    ):
-        """Initialize QAOA optimizer.
-        
-        Args:
-            n_layers: Number of QAOA layers (p parameter)
-            backend: Quantum backend to use
-            shots: Number of measurement shots
-        """
+    def __init__(self, config: QAOAConfig):
         if not QISKIT_AVAILABLE:
-            raise ImportError(
-                "Qiskit is required for QAOA optimization. "
-                "Install with: pip install 'alphagenome-plus[quantum]'"
-            )
+            raise ImportError("Qiskit is required for quantum optimization")
         
-        self.n_layers = n_layers
-        self.backend = AerSimulator() if backend == 'qiskit_aer' else backend
-        self.shots = shots
-    
-    def optimize_selection(
-        self,
-        variants: List[genome.Variant],
-        scores: np.ndarray,
-        constraints: Optional[Dict[str, Any]] = None,
-    ) -> OptimizationResult:
-        """Optimize variant selection using QAOA.
+        self.config = config
+        self.sampler = Sampler()
+        
+    def build_cost_hamiltonian(self, 
+                               scores: np.ndarray,
+                               correlations: np.ndarray,
+                               k: int) -> Tuple[np.ndarray, float]:
+        """Build cost Hamiltonian for variant selection.
         
         Args:
-            variants: List of candidate variants
-            scores: Pathogenicity or importance scores
-            constraints: Selection constraints
+            scores: Pathogenicity scores for each variant (n_variants,)
+            correlations: Correlation matrix between variants (n_variants, n_variants)
+            k: Number of variants to select
             
         Returns:
-            OptimizationResult with selected variants
+            Hamiltonian matrix and offset
         """
-        constraints = constraints or {}
-        max_variants = constraints.get('max_variants', len(variants))
-        min_distance = constraints.get('min_distance', 0)
+        n = len(scores)
         
-        # Build QUBO formulation
-        Q = self._build_qubo_matrix(variants, scores, constraints)
+        # Construct QUBO matrix
+        # Maximize: sum_i score_i * x_i - lambda * sum_{i<j} corr_ij * x_i * x_j
+        # Subject to: sum_i x_i = k
         
-        # Create QAOA circuit
-        n_qubits = len(variants)
-        circuit = self._create_qaoa_circuit(Q, n_qubits)
-        
-        # Optimize parameters
-        best_params, best_value = self._optimize_parameters(circuit, Q)
-        
-        # Get optimal solution
-        selected_indices = self._get_solution(circuit, best_params, n_qubits)
-        
-        # Filter to satisfy constraints
-        selected_indices = self._enforce_constraints(
-            selected_indices,
-            variants,
-            max_variants,
-            min_distance,
-        )
-        
-        selected_variants = [variants[i] for i in selected_indices]
-        
-        return OptimizationResult(
-            selected_variants=selected_variants,
-            objective_value=best_value,
-            qaoa_params={'gamma': best_params[:self.n_layers],
-                        'beta': best_params[self.n_layers:]},
-            iterations=100,  # From optimization
-        )
-    
-    def _build_qubo_matrix(
-        self,
-        variants: List[genome.Variant],
-        scores: np.ndarray,
-        constraints: Dict[str, Any],
-    ) -> np.ndarray:
-        """Build QUBO matrix for variant selection problem.
-        
-        Args:
-            variants: Candidate variants
-            scores: Variant scores
-            constraints: Problem constraints
-            
-        Returns:
-            QUBO matrix Q
-        """
-        n = len(variants)
         Q = np.zeros((n, n))
         
-        # Diagonal: maximize scores
-        np.fill_diagonal(Q, -scores)  # Negative for maximization
-        
-        # Off-diagonal: penalize selecting close variants
-        min_distance = constraints.get('min_distance', 0)
-        penalty = constraints.get('distance_penalty', 10.0)
-        
+        # Linear terms (negative because we want to maximize scores)
+        for i in range(n):
+            Q[i, i] = -scores[i]
+            
+        # Quadratic terms (positive penalty for correlated variants)
+        penalty = 2.0
         for i in range(n):
             for j in range(i + 1, n):
-                # Calculate distance between variants
-                if variants[i].chromosome == variants[j].chromosome:
-                    dist = abs(variants[i].position - variants[j].position)
-                    if dist < min_distance:
-                        Q[i, j] = penalty
-                        Q[j, i] = penalty
-        
-        # Constraint: maximum number of variants
-        max_variants = constraints.get('max_variants', n)
-        if max_variants < n:
-            constraint_penalty = constraints.get('count_penalty', 20.0)
-            # Add penalty for selecting more than max_variants
-            for i in range(n):
-                for j in range(i + 1, n):
-                    Q[i, j] += constraint_penalty / (n * (n - 1) / 2)
-        
-        return Q
+                Q[i, j] = penalty * correlations[i, j]
+                Q[j, i] = penalty * correlations[i, j]
+                
+        # Cardinality constraint using penalty method
+        constraint_penalty = 10.0
+        for i in range(n):
+            Q[i, i] += constraint_penalty * (1 - 2 * k)
+            for j in range(n):
+                if i != j:
+                    Q[i, j] += constraint_penalty
+                    
+        return Q, 0.0
     
-    def _create_qaoa_circuit(
-        self,
-        Q: np.ndarray,
-        n_qubits: int,
-    ) -> QuantumCircuit:
-        """Create QAOA circuit for QUBO problem.
+    def create_qaoa_circuit(self, 
+                           hamiltonian: np.ndarray,
+                           p: int) -> QuantumCircuit:
+        """Create QAOA circuit for the given Hamiltonian.
         
         Args:
-            Q: QUBO matrix
-            n_qubits: Number of qubits
+            hamiltonian: Cost Hamiltonian matrix
+            p: Number of QAOA layers
             
         Returns:
-            Parameterized QAOA circuit
+            Parameterized quantum circuit
         """
-        # Create parameters
-        gamma = [Parameter(f'γ_{i}') for i in range(self.n_layers)]
-        beta = [Parameter(f'β_{i}') for i in range(self.n_layers)]
+        n = hamiltonian.shape[0]
+        qc = QuantumCircuit(n)
         
-        # Initialize circuit
-        qc = QuantumCircuit(n_qubits)
-        
-        # Initial state: uniform superposition
-        qc.h(range(n_qubits))
+        # Initial state: equal superposition
+        qc.h(range(n))
         
         # QAOA layers
-        for layer in range(self.n_layers):
-            # Problem Hamiltonian (cost)
-            for i in range(n_qubits):
-                # Diagonal terms
-                qc.rz(2 * gamma[layer] * Q[i, i], i)
-                # Off-diagonal terms
-                for j in range(i + 1, n_qubits):
-                    if Q[i, j] != 0:
-                        qc.cx(i, j)
-                        qc.rz(2 * gamma[layer] * Q[i, j], j)
-                        qc.cx(i, j)
+        beta = [Parameter(f'β_{i}') for i in range(p)]
+        gamma = [Parameter(f'γ_{i}') for i in range(p)]
+        
+        for layer in range(p):
+            # Cost Hamiltonian evolution
+            for i in range(n):
+                qc.rz(2 * gamma[layer] * hamiltonian[i, i], i)
+                
+            for i in range(n):
+                for j in range(i + 1, n):
+                    if abs(hamiltonian[i, j]) > 1e-10:
+                        qc.rzz(2 * gamma[layer] * hamiltonian[i, j], i, j)
             
-            # Mixer Hamiltonian
-            for i in range(n_qubits):
+            # Mixer Hamiltonian evolution
+            for i in range(n):
                 qc.rx(2 * beta[layer], i)
-        
-        # Measurement
+                
         qc.measure_all()
-        
         return qc
     
-    def _optimize_parameters(
-        self,
-        circuit: QuantumCircuit,
-        Q: np.ndarray,
-    ) -> tuple:
-        """Optimize QAOA parameters using classical optimization.
+    def optimize(self,
+                scores: np.ndarray,
+                correlations: np.ndarray,
+                k: int) -> Tuple[List[int], float]:
+        """Run QAOA optimization to select k variants.
         
         Args:
-            circuit: QAOA circuit
-            Q: QUBO matrix
+            scores: Pathogenicity scores (n_variants,)
+            correlations: Correlation matrix (n_variants, n_variants)
+            k: Number of variants to select
             
         Returns:
-            (best_params, best_value)
+            Selected variant indices and objective value
         """
-        from scipy.optimize import minimize
+        hamiltonian, offset = self.build_cost_hamiltonian(scores, correlations, k)
+        qc = self.create_qaoa_circuit(hamiltonian, self.config.num_layers)
         
-        def objective(params):
-            """Evaluate QAOA circuit with given parameters."""
-            bound_circuit = circuit.assign_parameters(params)
-            sampler = Sampler()
-            result = sampler.run(bound_circuit, shots=self.shots).result()
+        def cost_function(params):
+            """Evaluate cost function for given parameters."""
+            bound_circuit = qc.bind_parameters(params)
+            job = self.sampler.run(bound_circuit, shots=self.config.shots)
+            result = job.result()
+            
             counts = result.quasi_dists[0]
             
-            # Calculate expectation value
-            expectation = 0
+            # Compute expectation value
+            expectation = 0.0
             for bitstring, prob in counts.items():
-                # Convert to binary array
-                x = np.array([int(b) for b in format(bitstring, f'0{len(Q)}b')])
-                # Evaluate QUBO
-                cost = x.T @ Q @ x
-                expectation += cost * prob
+                # Convert bitstring to binary array
+                x = np.array([int(b) for b in format(bitstring, f'0{len(scores)}b')])
+                
+                # Compute cost
+                cost = x @ hamiltonian @ x
+                expectation += prob * cost
+                
+            return expectation + offset
+        
+        # Initialize parameters
+        if self.config.initial_point is None:
+            initial_point = np.random.uniform(0, 2*np.pi, 2*self.config.num_layers)
+        else:
+            initial_point = np.array(self.config.initial_point)
             
-            return expectation
-        
-        # Initial parameters
-        init_params = np.random.uniform(0, 2 * np.pi, 2 * self.n_layers)
-        
         # Optimize
-        result = minimize(objective, init_params, method='COBYLA', options={'maxiter': 100})
+        result = opt.minimize(cost_function,
+                            initial_point,
+                            method=self.config.optimizer,
+                            options={'maxiter': self.config.max_iterations})
         
-        return result.x, result.fun
+        # Get final measurement
+        bound_circuit = qc.bind_parameters(result.x)
+        job = self.sampler.run(bound_circuit, shots=self.config.shots)
+        counts = job.result().quasi_dists[0]
+        
+        # Select most frequent bitstring with k ones
+        valid_solutions = {}
+        for bitstring, prob in counts.items():
+            x = np.array([int(b) for b in format(bitstring, f'0{len(scores)}b')])
+            if x.sum() == k:
+                valid_solutions[bitstring] = prob
+                
+        if valid_solutions:
+            best_solution = max(valid_solutions.items(), key=lambda x: x[1])[0]
+            x_best = np.array([int(b) for b in format(best_solution, f'0{len(scores)}b')])
+        else:
+            # Fallback: select top k by score
+            x_best = np.zeros(len(scores))
+            top_k_indices = np.argsort(scores)[-k:]
+            x_best[top_k_indices] = 1
+            
+        selected_indices = np.where(x_best == 1)[0].tolist()
+        objective = scores[selected_indices].sum()
+        
+        return selected_indices, objective
+
+
+class QuantumFeatureSelector:
+    """Quantum-inspired feature selection for genomic data."""
     
-    def _get_solution(
-        self,
-        circuit: QuantumCircuit,
-        params: np.ndarray,
-        n_qubits: int,
-    ) -> List[int]:
-        """Extract solution from optimized QAOA circuit.
+    def __init__(self, n_features: int, n_qubits: int = None):
+        self.n_features = n_features
+        self.n_qubits = n_qubits or min(n_features, 20)
+        
+    def select_features(self,
+                       X: np.ndarray,
+                       y: np.ndarray,
+                       k: int) -> List[int]:
+        """Select k most informative features using quantum-inspired algorithm.
         
         Args:
-            circuit: QAOA circuit
-            params: Optimized parameters
-            n_qubits: Number of qubits
+            X: Feature matrix (n_samples, n_features)
+            y: Target vector (n_samples,)
+            k: Number of features to select
             
         Returns:
-            List of selected variant indices
+            Indices of selected features
         """
-        # Bind parameters and execute
-        bound_circuit = circuit.assign_parameters(params)
-        sampler = Sampler()
-        result = sampler.run(bound_circuit, shots=self.shots).result()
-        counts = result.quasi_dists[0]
+        # Compute mutual information scores
+        scores = self._compute_feature_scores(X, y)
         
-        # Get most probable bitstring
-        best_bitstring = max(counts.items(), key=lambda x: x[1])[0]
+        # Compute feature correlations
+        correlations = np.corrcoef(X.T)
         
-        # Convert to selected indices
-        binary = format(best_bitstring, f'0{n_qubits}b')
-        selected = [i for i, bit in enumerate(binary) if bit == '1']
+        # Use QAOA to select features
+        qaoa = VariantPrioritizationQAOA(QAOAConfig(num_layers=2))
+        selected_indices, _ = qaoa.optimize(scores, np.abs(correlations), k)
         
-        return selected
+        return selected_indices
     
-    def _enforce_constraints(
-        self,
-        selected: List[int],
-        variants: List[genome.Variant],
-        max_variants: int,
-        min_distance: int,
-    ) -> List[int]:
-        """Enforce hard constraints on solution.
-        
-        Args:
-            selected: Initially selected indices
-            variants: All variants
-            max_variants: Maximum to select
-            min_distance: Minimum distance between variants
-            
-        Returns:
-            Filtered selected indices
-        """
-        # Sort by position for distance checking
-        selected_sorted = sorted(selected, key=lambda i: (
-            variants[i].chromosome,
-            variants[i].position
-        ))
-        
-        # Filter by distance constraint
-        filtered = []
-        for idx in selected_sorted:
-            if not filtered:
-                filtered.append(idx)
-                continue
-            
-            # Check distance to previously selected
-            last_var = variants[filtered[-1]]
-            curr_var = variants[idx]
-            
-            if last_var.chromosome != curr_var.chromosome:
-                filtered.append(idx)
-            elif curr_var.position - last_var.position >= min_distance:
-                filtered.append(idx)
-        
-        # Limit to max_variants
-        if len(filtered) > max_variants:
-            filtered = filtered[:max_variants]
-        
-        return filtered
+    def _compute_feature_scores(self, X: np.ndarray, y: np.ndarray) -> np.ndarray:
+        """Compute feature importance scores."""
+        from sklearn.feature_selection import mutual_info_classif
+        return mutual_info_classif(X, y)
